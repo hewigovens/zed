@@ -125,7 +125,9 @@ impl CommandPalette {
         );
 
         let picker = cx.new(|cx| {
-            let picker = Picker::uniform_list(delegate, window, cx);
+            // The command palette runs a one-shot action; there's nothing to
+            // return to, so it opts out of `workspace::ReopenLastModal`.
+            let picker = Picker::uniform_list(delegate, window, cx).reopenable(false, cx);
             picker.set_query(query, window, cx);
             picker
         });
