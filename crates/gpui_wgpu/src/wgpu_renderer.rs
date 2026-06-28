@@ -131,6 +131,39 @@ impl WgpuResources {
     }
 }
 
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn wait_for_surface_texture_release(resources: &WgpuResources) {
+    if let Err(error) = resources.device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    }) {
+        warn!("Failed to wait for surface texture release: {error:?}");
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+fn wait_for_surface_texture_release(_: &WgpuResources) {}
+
+fn release_renderer_resources(resources: WgpuResources) {
+    wait_for_surface_texture_release(&resources);
+    release_renderer_resources_impl(resources);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn release_renderer_resources_impl(resources: WgpuResources) {
+    warn!("Leaking wgpu renderer resources on linux/aarch64 to avoid a Vulkan swapchain teardown panic");
+    std::mem::forget(resources);
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+fn release_renderer_resources_impl(_resources: WgpuResources) {}
+
+impl Drop for WgpuResources {
+    fn drop(&mut self) {
+        wait_for_surface_texture_release(self);
+    }
+}
+
 pub struct WgpuRenderer {
     /// Shared GPU context for device recovery coordination (unused on WASM).
     #[allow(dead_code)]
@@ -1125,6 +1158,7 @@ impl WgpuRenderer {
                 drop(frame);
                 let surface_config = self.surface_config.clone();
                 let resources = self.resources_mut();
+                wait_for_surface_texture_release(resources);
                 resources
                     .surface
                     .configure(&resources.device, &surface_config);
@@ -1133,6 +1167,7 @@ impl WgpuRenderer {
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 let surface_config = self.surface_config.clone();
                 let resources = self.resources_mut();
+                wait_for_surface_texture_release(resources);
                 resources
                     .surface
                     .configure(&resources.device, &surface_config);
@@ -1325,6 +1360,7 @@ impl WgpuRenderer {
                         self.instance_buffer_capacity
                     );
                     frame.present();
+                    wait_for_surface_texture_release(self.resources());
                     return true;
                 }
                 self.grow_instance_buffer();
@@ -1335,6 +1371,7 @@ impl WgpuRenderer {
                 .queue
                 .submit(std::iter::once(encoder.finish()));
             frame.present();
+            wait_for_surface_texture_release(self.resources());
             return true;
         }
     }
@@ -1759,7 +1796,9 @@ impl WgpuRenderer {
     pub fn destroy(&mut self) {
         // Release surface-bound GPU resources eagerly so the underlying native
         // window can be destroyed before the renderer itself is dropped.
-        self.resources.take();
+        if let Some(resources) = self.resources.take() {
+            release_renderer_resources(resources);
+        }
     }
 
     /// Returns true if the GPU device was lost and recovery is needed.
@@ -1785,7 +1824,11 @@ impl WgpuRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
     {
-        let gpu_context = self.context.as_ref().expect("recover requires gpu_context");
+        let gpu_context = self
+            .context
+            .as_ref()
+            .expect("recover requires gpu_context")
+            .clone();
 
         // Check if another window already recovered the context
         let needs_new_context = gpu_context
@@ -1801,7 +1844,7 @@ impl WgpuRenderer {
             log::warn!("GPU device lost, recreating context...");
 
             // Drop old resources to release Arc<Device>/Arc<Queue> and GPU resources
-            self.resources = None;
+            self.destroy();
             *gpu_context.borrow_mut() = None;
 
             // Wait briefly for the GPU driver to stabilize, then try to
@@ -1830,11 +1873,11 @@ impl WgpuRenderer {
             transparent: self.surface_config.alpha_mode != wgpu::CompositeAlphaMode::Opaque,
             preferred_present_mode: Some(self.surface_config.present_mode),
         };
-        let gpu_context = Rc::clone(gpu_context);
+        let gpu_context = Rc::clone(&gpu_context);
         let ctx_ref = gpu_context.borrow();
         let context = ctx_ref.as_ref().expect("context should exist");
 
-        self.resources = None;
+        self.destroy();
         self.atlas.handle_device_lost(context);
 
         *self = Self::new_internal(
@@ -1848,6 +1891,12 @@ impl WgpuRenderer {
 
         log::info!("GPU recovery complete");
         Ok(())
+    }
+}
+
+impl Drop for WgpuRenderer {
+    fn drop(&mut self) {
+        self.destroy();
     }
 }
 
